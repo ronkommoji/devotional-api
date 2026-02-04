@@ -41,28 +41,30 @@ def parse_date(date_str: str) -> Optional[str]:
         return None
 
 
-async def scrape_devotional_page(url: str) -> Dict:
+async def scrape_devotional_page(url: str, html_text: Optional[str] = None) -> Dict:
     """
     Scrape a full devotional page.
-    
+
     Args:
         url: Full URL or path to devotional page
-        
+        html_text: Optional pre-fetched HTML (avoids duplicate request when already fetched)
+
     Returns:
         Dictionary with devotional data
     """
     # Ensure full URL
     if not url.startswith("http"):
         url = BASE_URL + url if url.startswith("/") else f"{BASE_URL}/{url}"
-    
-    # Fetch raw HTML to check for embedded data
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        html_text = response.text
+
+    # Use provided HTML or fetch
+    if html_text is None:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            html_text = response.text
     
     # Try to extract JSON data from window._model
     page_data = None
@@ -372,50 +374,126 @@ async def scrape_devotional_list(limit: int = 10, offset: int = 0) -> List[Dict]
     return devotionals
 
 
+def _parse_devotional_nav(html_text: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Extract from a devotional page HTML: (date_yyyy_mm_dd, previous_url, next_url).
+    Returns (None, None, None) if parsing fails.
+    """
+    date_str = None
+    prev_url = None
+    next_url = None
+    model_start = html_text.find("window._model = {")
+    if model_start == -1:
+        return (date_str, prev_url, next_url)
+    brace_count = 0
+    start_pos = model_start + len("window._model = ")
+    end_pos = start_pos
+    for i in range(start_pos, min(start_pos + 500000, len(html_text))):
+        if html_text[i] == "{":
+            brace_count += 1
+        elif html_text[i] == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                end_pos = i + 1
+                break
+    try:
+        data = json.loads(html_text[start_pos:end_pos])
+    except json.JSONDecodeError:
+        return (date_str, prev_url, next_url)
+    pm = data.get("pageModel") or {}
+    if "otherDate" in pm:
+        raw = pm["otherDate"]
+        if isinstance(raw, str) and "T" in raw:
+            date_str = raw.split("T")[0]
+        elif isinstance(raw, str):
+            date_str = parse_date(raw) or raw[:10]
+    if not date_str and "devotionalDate" in pm:
+        date_str = parse_date(pm["devotionalDate"]) or ""
+    prev_path = pm.get("previousDevotionalUrl") or ""
+    next_path = pm.get("nextDevotionalUrl") or ""
+    if prev_path:
+        prev_url = BASE_URL + prev_path if prev_path.startswith("/") else prev_path
+    if next_path:
+        next_url = BASE_URL + next_path if next_path.startswith("/") else next_path
+    return (date_str, prev_url, next_url)
+
+
 async def scrape_by_date(date: str) -> Dict:
     """
     Scrape devotional for a specific date.
-    
+
+    Starts from "today" (first devotional on the list page), then follows
+    previousDevotionalUrl / nextDevotionalUrl until the page date matches.
+
     Args:
         date: Date in YYYY-MM-DD format
-        
+
     Returns:
         Dictionary with devotional data
     """
-    # Parse the date
     try:
-        target_date = datetime.strptime(date, "%Y-%m-%d")
+        target_dt = datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
         raise ValueError(f"Invalid date format: {date}. Use YYYY-MM-DD")
-    
-    # Get list of devotionals and find the one matching the date
-    soup = await fetch_page(DEVOTIONALS_URL)
-    
-    # Find all devotional items with dates
-    devotional_items = soup.find_all("a", href=re.compile(r"/devotionals/devotional-category/"))
-    
-    for item in devotional_items:
-        # Check parent for date
-        parent = item.find_parent()
-        if parent:
-            date_text = parent.get_text()
-            # Try to find date in format like "18 Jan 2026" or "January 18, 2026"
-            date_match = re.search(r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{4})", date_text, re.I)
-            if date_match:
-                day, month, year = date_match.groups()
-                month_map = {
-                    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-                    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
-                }
-                month_num = month_map.get(month.lower()[:3], 0)
-                if month_num:
-                    item_date = datetime(int(year), month_num, int(day))
-                    if item_date.date() == target_date.date():
-                        url = item.get("href", "")
-                        if url:
-                            full_url = BASE_URL + url if url.startswith("/") else url
-                            return await scrape_devotional_page(full_url)
-    
+    target_str = date
+
+    # Get starting URL: same as scrape_today (first URL on list page)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        response = await client.get(DEVOTIONALS_URL, headers=headers)
+        response.raise_for_status()
+        list_html = response.text
+
+    url_pattern = re.compile(r"/devotionals/devotional-category/[^\"')\s<>]+")
+    found_paths = url_pattern.findall(list_html)
+    seen = set()
+    unique_paths = [p for p in found_paths if p not in seen and not seen.add(p)]
+    if not unique_paths:
+        raise ValueError(f"Devotional not found for date: {date}")
+
+    # Prefer /en/ URL so we stay on same locale
+    current_path = unique_paths[0]
+    current_url = BASE_URL + ("/en" + current_path if current_path.startswith("/") else "/en/" + current_path)
+
+    max_steps = 400
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        for _ in range(max_steps):
+            try:
+                resp = await client.get(current_url, headers=headers)
+                resp.raise_for_status()
+                page_html = resp.text
+            except Exception:
+                break
+            page_date, prev_url, next_url = _parse_devotional_nav(page_html)
+            if page_date and page_date == target_str:
+                return await scrape_devotional_page(current_url, html_text=page_html)
+            if page_date:
+                try:
+                    page_dt = datetime.strptime(page_date, "%Y-%m-%d")
+                    if page_dt.date() == target_dt.date():
+                        return await scrape_devotional_page(current_url, html_text=page_html)
+                    if target_dt.date() < page_dt.date() and prev_url:
+                        current_url = prev_url
+                        continue
+                    if target_dt.date() > page_dt.date() and next_url:
+                        current_url = next_url
+                        continue
+                except ValueError:
+                    pass
+            # No date or no match: walk backward if we're past target, else forward
+            if prev_url:
+                current_url = prev_url
+                continue
+            if next_url:
+                current_url = next_url
+                continue
+            break
+
     raise ValueError(f"Devotional not found for date: {date}")
 
 
